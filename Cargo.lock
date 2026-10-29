@@ -160,6 +160,7 @@ dependencies = [
  "tail-core",
  "tao",
  "webview2-com",
+ "windows",
  "winres",
  "wry",
 ]

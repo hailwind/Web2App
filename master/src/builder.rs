@@ -52,16 +52,26 @@ pub fn validate_url(url: &str) -> Result<(), String> {
 
 /// 主流程：把内嵌 child 模板复制为产物，注入用户图标，追加尾部配置，可选签名。
 ///
+/// `auth_user` / `auth_password` 为可选的 HTTP Basic Auth 凭据（空串 = 不启用），
+/// 与 URL 一起在打包时写入尾部；产物运行时 `AppConfig::effective_url` 将其嵌入
+/// 加载地址，引擎自动发送 `Authorization: Basic` 头（见 child/webview）。
+///
 /// 打包顺序（CRITICAL — 防止尾部丢失）：
 /// 1. 写 CHILD_TEMPLATE → tmp_out
 /// 2. if icon_png Some: inject_file_icon(tmp_out) — 非阻塞（失败 child 保留 w2a 文件图标）
-/// 3. write_tail(tmp_out, config) [config 携带 icon_png 供运行时窗口图标]
+/// 3. write_tail(tmp_out, config) [config 携带 icon_png 与 Basic Auth 凭据]
 /// 4. mkdir parent + rename tmp → out（回退 copy+delete）
 /// 5. maybe_sign(out) [非阻塞]
 /// 6. return BuildOutput
 ///
 /// 注入图标改写 PE .rsrc；必须在追加尾部之前完成，否则尾部会被 EndUpdateResource 丢弃。
-pub fn pack(out_path: &Path, url: &str, icon_png: Option<Vec<u8>>) -> io::Result<BuildOutput> {
+pub fn pack(
+  out_path: &Path,
+  url: &str,
+  icon_png: Option<Vec<u8>>,
+  auth_user: &str,
+  auth_password: &str,
+) -> io::Result<BuildOutput> {
   validate_url(url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
   let title = tail_core::default_title(url);
@@ -84,8 +94,18 @@ pub fn pack(out_path: &Path, url: &str, icon_png: Option<Vec<u8>>) -> io::Result
       }
     }
 
-    // 3) 追加尾部配置（config 携带 icon_png 供运行时窗口图标）
-    let config = AppConfig::new(url.to_string(), title, icon_png);
+    // 3) 追加尾部配置（config 携带 icon_png 与 Basic Auth 凭据供运行时）
+    let config = if !auth_user.is_empty() {
+      AppConfig::with_auth(
+        url.to_string(),
+        title,
+        icon_png,
+        auth_user.to_string(),
+        auth_password.to_string(),
+      )
+    } else {
+      AppConfig::new(url.to_string(), title, icon_png)
+    };
     let size = crate::tail_write::write_tail(&tmp_out, &config)?;
 
     // 4) 原子落盘：先写临时文件再 rename，避免半写产物。
@@ -158,7 +178,7 @@ mod tests {
     fs::create_dir_all(&dir).unwrap();
     let out = dir.join("product.bin");
 
-    let result = pack(&out, "https://example.com", None).unwrap();
+    let result = pack(&out, "https://example.com", None, "", "").unwrap();
 
     let raw = fs::read(&out).unwrap();
     let expected_base = tail_core::strip_tail(CHILD_TEMPLATE);
@@ -176,6 +196,25 @@ mod tests {
   }
 
   #[test]
+  fn pack_with_auth_stores_credentials_in_tail() {
+    // Basic Auth 凭据 → 写入尾部（可读回），无凭据 → 空串
+    let dir = std::env::temp_dir().join("web2app_pack_auth");
+    fs::create_dir_all(&dir).unwrap();
+
+    let out = dir.join("product.bin");
+    pack(&out, "https://admin.example.com", None, "svc", "s3cret").unwrap();
+    let cfg = tail_core::read_tail_from(&out).unwrap().unwrap();
+    assert_eq!(cfg.auth_user, "svc");
+    assert_eq!(cfg.auth_password, "s3cret");
+    // 无凭据打包
+    let out2 = dir.join("product2.bin");
+    pack(&out2, "https://example.com", None, "", "").unwrap();
+    let cfg2 = tail_core::read_tail_from(&out2).unwrap().unwrap();
+    assert!(cfg2.auth_user.is_empty());
+    assert!(cfg2.auth_password.is_empty());
+  }
+
+  #[test]
   fn pack_with_icon_stores_in_tail() {
     // 用户图标 → 内嵌尾部配置（可读回，字节一致），不选图 → icon 为 None
     let dir = std::env::temp_dir().join("web2app_pack_icon");
@@ -183,20 +222,20 @@ mod tests {
 
     let png: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(37)).collect(); // 任意字节即可（协议层不管内容）
     let out = dir.join("product.bin");
-    pack(&out, "https://example.com", Some(png.clone())).unwrap();
+    pack(&out, "https://example.com", Some(png.clone()), "", "").unwrap();
     let cfg = tail_core::read_tail_from(&out).unwrap().unwrap();
     assert_eq!(cfg.url, "https://example.com");
     assert_eq!(cfg.icon_png.as_deref(), Some(png.as_slice()));
 
     // 不选图：icon 字段缺失 → None
     let out2 = dir.join("product2.bin");
-    pack(&out2, "https://example.com", None).unwrap();
+    pack(&out2, "https://example.com", None, "", "").unwrap();
     let cfg2 = tail_core::read_tail_from(&out2).unwrap().unwrap();
     assert!(cfg2.icon_png.is_none());
 
     // 垃圾图标字节 → inject 失败非阻塞 → tail 仍存 icon_png（运行时解码失败自动回落）
     let out3 = dir.join("product3.bin");
-    pack(&out3, "https://example.com", Some(b"garbage".to_vec())).unwrap();
+    pack(&out3, "https://example.com", Some(b"garbage".to_vec()), "", "").unwrap();
     assert!(out3.exists());
   }
 
@@ -207,16 +246,16 @@ mod tests {
     fs::create_dir_all(&dir).unwrap();
     let out = dir.join("product.bin");
 
-    pack(&out, "https://first.com", None).unwrap();
-    pack(&out, "https://second.com", None).unwrap();
+    pack(&out, "https://first.com", None, "", "").unwrap();
+    pack(&out, "https://second.com", None, "", "").unwrap();
 
     let cfg = tail_core::read_tail_from(&out).unwrap().unwrap();
     assert_eq!(cfg.url, "https://second.com");
 
     // 幂等：同 URL 重复打包体积稳定（覆盖旧尾部，不叠加）
-    pack(&out, "https://second.com", None).unwrap();
+    pack(&out, "https://second.com", None, "", "").unwrap();
     let size2 = fs::metadata(&out).unwrap().len();
-    pack(&out, "https://second.com", None).unwrap();
+    pack(&out, "https://second.com", None, "", "").unwrap();
     let size3 = fs::metadata(&out).unwrap().len();
     assert_eq!(size2, size3);
   }
@@ -230,7 +269,7 @@ mod tests {
     // 占位目录充当产物目标：file → dir 的 rename/copy 必然失败
     fs::create_dir_all(dir.join("product.bin")).unwrap();
 
-    let result = pack(&dir.join("product.bin"), "https://example.com", None);
+    let result = pack(&dir.join("product.bin"), "https://example.com", None, "", "");
     assert!(result.is_err());
     // 关键断言：不留 tmp 残渣。tmp 名 = with_extension("{pid}.{seq}.tmp.pack")，
     // 固定名断言不再适用 → 扫描目录确认无任何 *.tmp.pack* 残留。

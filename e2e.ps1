@@ -1,4 +1,4 @@
-# e2e.ps1 — Web2App v2 端到端验证（手动工具，非 CI 门禁）
+﻿# e2e.ps1 — Web2App v2 端到端验证（手动工具，非 CI 门禁）
 #
 # v2 架构下的全链路检查：
 #   1. 静态身份与资源：child/web2app 的 FileDescription=Web2App（任务管理器进程名
@@ -230,6 +230,34 @@ try {
   Assert (Close-App $proc2) "gen2 closed"
   Start-Sleep -Seconds 2
   Assert ((Count-Residue $p2 "Web2App\apps\second.io") -eq 0) "gen2 zero residue"
+
+  # ---- 8. CLI Basic Auth 凭据写入尾部 JSON ----
+  Write-Host "`n[7] CLI --auth-user / --auth-password flow into tail JSON"
+  $authOut = Join-Path $dir "auth-test.exe"
+  $procAuth = Start-Process -FilePath $MasterPath -ArgumentList @("--pack", "https://secure.example.com", "--out", $authOut, "--auth-user", "admin", "--auth-password", "s3cret") -Wait -PassThru -NoNewWindow
+  Assert ($procAuth.ExitCode -eq 0) "master --pack with auth flags exit 0 (got $($procAuth.ExitCode))"
+  Assert (Test-Path $authOut) "auth product exists"
+  # 无凭据对照
+  $noAuthOut = Join-Path $dir "noauth-test.exe"
+  $procNoAuth = Start-Process -FilePath $MasterPath -ArgumentList @("--pack", "https://open.example.com", "--out", $noAuthOut) -Wait -PassThru -NoNewWindow
+  Assert ($procNoAuth.ExitCode -eq 0) "master --pack without auth exit 0 (got $($procNoAuth.ExitCode))"
+  Assert (Test-Path $noAuthOut) "no-auth product exists"
+
+  # 读回尾部 JSON：v3 帧 = payload | MAGIC(16) | len(u64 LE) | ver(u8) | crc32(u32 LE)
+  # 末 29 字节为 MAGIC+len+ver+crc；len 位于 L-13，payload 位于 [L-29-len, L-29)
+  $authBytes = [System.IO.File]::ReadAllBytes($authOut)
+  $authTailLen = [BitConverter]::ToUInt64($authBytes, $authBytes.Length - 13)
+  $authPayloadStart = $authBytes.Length - 29 - [int]$authTailLen
+  $authPayload = [System.Text.Encoding]::UTF8.GetString($authBytes, $authPayloadStart, [int]$authTailLen)
+  Assert ($authPayload.Contains('"user":"admin"')) "tail JSON contains user=admin (got: $authPayload)"
+  Assert ($authPayload.Contains('"pass":"s3cret"')) "tail JSON contains pass=s3cret"
+
+  $noAuthBytes = [System.IO.File]::ReadAllBytes($noAuthOut)
+  $noAuthLen = [BitConverter]::ToUInt64($noAuthBytes, $noAuthBytes.Length - 13)
+  $noAuthStart = $noAuthBytes.Length - 29 - [int]$noAuthLen
+  $noAuthPayload = [System.Text.Encoding]::UTF8.GetString($noAuthBytes, $noAuthStart, [int]$noAuthLen)
+  Assert (-not $noAuthPayload.Contains('"user"')) "no-auth tail JSON has no user field"
+  Assert (-not $noAuthPayload.Contains('"pass"')) "no-auth tail JSON has no pass field"
 }
 finally {
   # 兜底：沙盒中任何仍存活的进程不阻塞清理（Close-App 正常路径已处理）

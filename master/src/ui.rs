@@ -1,8 +1,9 @@
 //! master/src/ui.rs — 母版启动界面（内嵌 HTML，零外部资源文件）。
 //!
-//! 验收红线：界面仅 URL 输入框、图标选择、打包按钮三个核心元素。
+//! 界面元素：URL 输入、图标选择、HTTP Basic Auth 凭据（可选）、打包按钮。
 //! 图标选图用浏览器原生 input[type=file]+FileReader（W3C 标准），
 //! 图片字节经 base64 由 IPC 传给原生，无需绝对路径。
+//! 凭据为可选字段，留空即不启用 Basic Auth。
 
 /// 母版 WebView 数据目录（固定名，不打扰任何 exe 目录）。
 /// 基目录探测由平台外壳 `crate::platform::data_dir` 持有（Windows = `%LOCALAPPDATA%`，
@@ -34,7 +35,7 @@ pub fn form_html() -> &'static str {
   h1 { font-size: 22px; margin-bottom: 6px; }
   p.sub { color: #8b93a7; font-size: 13px; margin-bottom: 26px; }
   label { display: block; font-size: 13px; color: #aab2c5; margin: 14px 0 6px; }
-  input[type=text] {
+  input[type=text], input[type=password] {
     width: 100%; padding: 11px 13px; font-size: 14px;
     background: #0f1117; color: #e6e8ee;
     border: 1px solid #2b3142; border-radius: 8px; outline: none;
@@ -44,6 +45,8 @@ pub fn form_html() -> &'static str {
     width: 100%; padding: 9px 11px; font-size: 13px; color: #aab2c5;
     background: #0f1117; border: 1px solid #2b3142; border-radius: 8px; outline: none;
   }
+  .section { margin-top: 20px; padding-top: 16px; border-top: 1px solid #262b38; }
+  .section-title { font-size: 12px; color: #5a6378; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 4px; }
   button {
     width: 100%; margin-top: 26px; padding: 13px;
     font-size: 15px; font-weight: 600; cursor: pointer;
@@ -63,6 +66,14 @@ pub fn form_html() -> &'static str {
 
   <label for="icon">应用图标（PNG，可选，缺省用 w2a）</label>
   <input type="file" id="icon" accept="image/png">
+
+  <div class="section">
+    <div class="section-title">HTTP Basic 认证（可选）</div>
+    <label for="auth-user">用户名</label>
+    <input type="text" id="auth-user" placeholder="留空则不启用">
+    <label for="auth-pass">密码</label>
+    <input type="password" id="auth-pass" placeholder="留空则不启用">
+  </div>
 
   <button id="pack">打 包</button>
   <div class="status" id="status"></div>
@@ -97,10 +108,13 @@ pub fn form_html() -> &'static str {
     // URL 清洗：剥除全部空白（含换行——防止伪造 IPC 的第二行图标字段）
     const url = $('url').value.replace(/\s+/g, '');
     if (!url) { $('status').style.color = '#ff8f8f'; $('status').textContent = '请输入 URL'; return; }
+    // 凭据：trim 首尾空白，保留内部字符（密码含空格等合法）
+    const authUser = $('auth-user').value.trim();
+    const authPass = $('auth-pass').value;
     $('status').style.color = '#7ee0a3';
     $('status').textContent = '打包中…';
     $('pack').disabled = true; // 防重复提交（set_status 回写时恢复）
-    window.ipc.postMessage('pack:' + url + '\n' + iconB64);
+    window.ipc.postMessage('pack:' + url + '\n' + iconB64 + '\n' + authUser + '\n' + authPass);
   });
 
   // 回车提交
@@ -126,19 +140,21 @@ pub fn product_filename(url: &str) -> String {
   format!("{}.deb", crate::platform::package_name(url))
 }
 
-/// 解析母版表单的 IPC 消息：`pack:<url>\n<base64 图标>`（图标行可缺失）。
+/// 解析母版表单的 IPC 消息：`pack:<url>\n<base64 图标>\n<authUser>\n<authPass>`。
 ///
-/// 与 JS 端发送约定（`'pack:' + url + '\n' + iconB64`）配对；本函数是
-/// Rust 侧协议契约的行为级规格持有者。返回 None = 非打包消息（忽略）。
+/// 与 JS 端发送约定（`'pack:' + url + '\n' + iconB64 + '\n' + authUser + '\n' + authPass`）
+/// 配对；本函数是 Rust 侧协议契约的行为级规格持有者。返回 None = 非打包消息（忽略）。
 /// URL 内空白由 JS 端剥除（防伪造第二行）；此处 splitn 使任何额外换行
-/// 天然落入图标区，不会污染 URL 字段。
-pub fn parse_pack_message(body: &str) -> Option<(String, Option<Vec<u8>>)> {
+/// 天然落入图标/凭据区，不会污染 URL 字段。凭据行可缺失（旧版表单）。
+pub fn parse_pack_message(body: &str) -> Option<(String, Option<Vec<u8>>, String, String)> {
   let rest = body.strip_prefix("pack:")?;
-  let mut lines = rest.splitn(2, '\n');
+  let mut lines = rest.splitn(4, '\n');
   let url = lines.next().unwrap_or("").to_string();
   let b64 = lines.next().unwrap_or("");
   let icon = if b64.is_empty() { None } else { tail_core::base64_decode(b64) };
-  Some((url, icon))
+  let auth_user = lines.next().unwrap_or("").to_string();
+  let auth_password = lines.next().unwrap_or("").to_string();
+  Some((url, icon, auth_user, auth_password))
 }
 
 #[cfg(test)]
@@ -150,6 +166,8 @@ mod tests {
     let h = form_html();
     assert!(h.contains(r#"id="url""#));
     assert!(h.contains(r#"id="icon""#));
+    assert!(h.contains(r#"id="auth-user""#));
+    assert!(h.contains(r#"id="auth-pass""#));
     assert!(h.contains(r#"id="pack""#));
     assert!(h.contains(r#"id="status""#));
     // 选图走 FileReader 字节传输，不依赖文件绝对路径
@@ -169,22 +187,49 @@ mod tests {
 
   #[test]
   fn parse_pack_message_with_icon() {
-    let msg = format!("pack:https://example.com\n{}", tail_core::base64_encode(b"\x89PNG-icon"));
-    let (url, icon) = parse_pack_message(&msg).unwrap();
+    let msg = format!("pack:https://example.com\n{}\n\n", tail_core::base64_encode(b"\x89PNG-icon"));
+    let (url, icon, user, pass) = parse_pack_message(&msg).unwrap();
     assert_eq!(url, "https://example.com");
     assert_eq!(icon.as_deref(), Some(b"\x89PNG-icon".as_slice()));
+    assert!(user.is_empty());
+    assert!(pass.is_empty());
   }
 
   #[test]
   fn parse_pack_message_without_icon() {
     // 无图标：第二行为空 → icon None
-    let (url, icon) = parse_pack_message("pack:https://example.com\n").unwrap();
+    let (url, icon, user, pass) = parse_pack_message("pack:https://example.com\n").unwrap();
     assert_eq!(url, "https://example.com");
     assert!(icon.is_none());
+    assert!(user.is_empty());
+    assert!(pass.is_empty());
     // 完全无换行分隔（仅 URL）→ 同样 None
-    let (url2, icon2) = parse_pack_message("pack:https://example.com").unwrap();
+    let (url2, icon2, user2, pass2) = parse_pack_message("pack:https://example.com").unwrap();
     assert_eq!(url2, "https://example.com");
     assert!(icon2.is_none());
+    assert!(user2.is_empty());
+    assert!(pass2.is_empty());
+  }
+
+  #[test]
+  fn parse_pack_message_with_auth() {
+    let msg = "pack:https://admin.example.com\n\nsvc\ntop-secret";
+    let (url, icon, user, pass) = parse_pack_message(msg).unwrap();
+    assert_eq!(url, "https://admin.example.com");
+    assert!(icon.is_none());
+    assert_eq!(user, "svc");
+    assert_eq!(pass, "top-secret");
+  }
+
+  #[test]
+  fn parse_pack_message_with_auth_and_icon() {
+    let b64 = tail_core::base64_encode(b"\x89PNG-icon");
+    let msg = format!("pack:https://a.com\n{}\nadmin\npass", b64);
+    let (url, icon, user, pass) = parse_pack_message(&msg).unwrap();
+    assert_eq!(url, "https://a.com");
+    assert_eq!(icon.as_deref(), Some(b"\x89PNG-icon".as_slice()));
+    assert_eq!(user, "admin");
+    assert_eq!(pass, "pass");
   }
 
   #[test]
@@ -197,7 +242,10 @@ mod tests {
   #[test]
   fn parse_pack_message_invalid_base64_degrades_to_no_icon() {
     // 非法 base64 → 解码失败 → icon None（不阻塞打包，回落默认图标）
-    let (url, icon) = parse_pack_message("pack:https://example.com\n!!!!invalid!!!!").unwrap();
+    let (url, icon) = {
+      let (u, i, _, _) = parse_pack_message("pack:https://example.com\n!!!!invalid!!!!").unwrap();
+      (u, i)
+    };
     assert_eq!(url, "https://example.com");
     assert!(icon.is_none());
   }
@@ -206,7 +254,10 @@ mod tests {
   fn parse_pack_message_forged_second_line_stays_in_icon_field() {
     // 伪造防御规格：URL 若含换行（绕过 JS 剥空白），第二段永远归图标区，
     // URL 字段只取第一行——图标解析失败回落默认，URL 不被注入污染。
-    let (url, icon) = parse_pack_message("pack:https://evil.com\nAAAAnot-base64###").unwrap();
+    let (url, icon) = {
+      let (u, i, _, _) = parse_pack_message("pack:https://evil.com\nAAAAnot-base64###").unwrap();
+      (u, i)
+    };
     assert_eq!(url, "https://evil.com");
     assert!(icon.is_none());
   }

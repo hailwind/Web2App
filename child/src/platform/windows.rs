@@ -20,13 +20,14 @@ use std::rc::Rc;
 
 use tao::event_loop::EventLoopProxy;
 use webview2_com::{
-  AcceleratorKeyPressedEventHandler,
+  AcceleratorKeyPressedEventHandler, BasicAuthenticationRequestedEventHandler,
   Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_KEY_EVENT_KIND, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
     COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN, COREWEBVIEW2_PHYSICAL_KEY_STATUS,
-    ICoreWebView2AcceleratorKeyPressedEventArgs,
+    ICoreWebView2AcceleratorKeyPressedEventArgs, ICoreWebView2_10,
   },
 };
+use windows::core::{Interface, HSTRING, PWSTR};
 use wry::raw_window_handle::{
   HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle,
 };
@@ -264,6 +265,83 @@ pub(crate) fn install_keys(webview: &WebView, proxy: EventLoopProxy<ChildEvent>)
   register_home_accel(webview, move || {
     let _ = proxy.send_event(ChildEvent::GoHome);
   });
+}
+
+// ============================================================================
+// HTTP Basic Auth（WebView2 `BasicAuthenticationRequested` 事件）
+// ============================================================================
+//
+// 背景：内嵌 `user:pass@` 的 URL 不靠——WebView2/Chromium 不会基于内嵌 userinfo
+// 预发 `Authorization` 头；正确姿势是响应服务端 401 挑战（`WWW-Authenticate:
+// Basic`）时经 `Authorization: Basic` 头发回。这与安卓 WebView 的
+// `onReceivedHttpAuthRequest` 回调一一对应（见 wx_clipper/browser 安卓 App 的做法）。
+//
+// 挂接：`ICoreWebView2_10::add_BasicAuthenticationRequested`（`webview2-com` 提供，
+// 版本 0.39 已含此事件；wry 0.57 通过 `webview.webview()` 暴露 `ICoreWebView2`，
+// 再 `cast` 到 `ICoreWebView2_10`）。`webview2-com` 的事件 handler 是
+// `BasicAuthenticationRequestedEventHandler`（`#[event_callback]` 宏生成），
+// 与 `AcceleratorKeyPressedEventHandler` 同构。
+//
+// 安全边界：只有「挑战主机 == 主域或其子域」才 proceed(user, pass)，否则 cancel。
+// 这样避免把凭据发出去到外部站点（与安卓侧 `isMainHost` 判定一致）。
+// 注册失败（如 WebView2 运行时过旧不支持 `_10`）静默忽略——能力为「额外认证」，
+// 失败不得回退既有行为（与 [`install_close_watchdog`] 同源策略）。
+pub(crate) fn install_basic_auth(webview: &WebView, auth_user: &str, auth_password: &str, main_url: &str) {
+  if auth_user.is_empty() && auth_password.is_empty() {
+    return;
+  }
+  // 主域（去协议前缀、userinfo、端口；含子域匹配判定，与 `tail_core::host_of` 语义一致）
+  let main_host = tail_core::host_of(main_url);
+  if main_host.is_empty() {
+    return;
+  }
+  // `SetUserName` / `SetPassword` 入参为 `impl Param<PCWSTR>`；`&HSTRING` 实现该边界
+  // （`windows` crate 已随 wry 在依赖树）。宽字符串需 NUL 结尾并存活至事件处理返回。
+  let user = HSTRING::from(auth_user);
+  let pass = HSTRING::from(auth_password);
+
+  // 事件挂在 **view**（`ICoreWebView2_10`）而非 controller；wry 的 `webview()`
+  // 返回 `ICoreWebView2`，需向上查（`cast`）到 `_10`。
+  let view = webview.webview();
+  let Ok(view10) = view.cast::<ICoreWebView2_10>() else {
+    return; // 运行时过旧不支持 _10 事件，静默降级
+  };
+
+  let handler = BasicAuthenticationRequestedEventHandler::create(Box::new(move |_sender, args| {
+    // `args` 为 `Option<ICoreWebView2BasicAuthenticationRequestedEventArgs>`（owned）。
+    if let Some(args) = args {
+      // 1) 读挑战 URI → 取 host，判定是否主域（或其子域）
+      let uri = {
+        let mut uri = PWSTR::null();
+        if unsafe { args.Uri(&mut uri) }.is_err() {
+          // 读不出 URI → 保守 cancel（不发凭据给未知来源）
+          let _ = unsafe { args.SetCancel(true) };
+          return Ok(());
+        }
+        unsafe { uri.to_string() }.unwrap_or_default()
+      };
+      let challenge_host = tail_core::host_of(&uri);
+      let is_main = !challenge_host.is_empty()
+        && (challenge_host == main_host || challenge_host.ends_with(&format!(".{main_host}")));
+
+      // 2) 命中主域且已配凭据 → 回填；否则 cancel（避免把凭据发给外部站点）。
+      if is_main {
+        let resp = match unsafe { args.Response() } {
+          Ok(r) => r,
+          Err(_) => return Ok(()),
+        };
+        let _ = unsafe { resp.SetUserName(&user) };
+        let _ = unsafe { resp.SetPassword(&pass) };
+      } else {
+        let _ = unsafe { args.SetCancel(true) };
+      }
+    }
+    Ok(())
+  }));
+  let mut token: i64 = 0;
+  unsafe {
+    let _ = view10.add_BasicAuthenticationRequested(&handler, &mut token);
+  }
 }
 
 // ============================================================================

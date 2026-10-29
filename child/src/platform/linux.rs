@@ -250,6 +250,13 @@ pub(crate) fn install_keys(webview: &WebView, proxy: EventLoopProxy<ChildEvent>)
   });
 }
 
+/// no-op：WebKitGTK 尚无宿主级 Basic Auth 挑战回调。
+///
+/// WebKitGTK 的 `WebViewAuth` 信号目前 wry 未暴露，而 `webkitgtk` 后端的
+/// `WebViewBuilder` 也没有 `set_basic_auth_user/pass` 方法。未来 wry 提供时
+/// 在此挂接；届时 Linux 侧与 Windows 的 `install_basic_auth` 形成对称。
+pub(crate) fn install_basic_auth(_webview: &WebView, _auth_user: &str, _auth_password: &str, _main_url: &str) {}
+
 // ============================================================================
 // WebView 挂载（TO-1 接缝项：Linux 必须走 GTK 容器，见下）
 // ============================================================================

@@ -29,8 +29,14 @@ use wry::{WebContext, WebView};
 /// 事件循环自定义事件。
 #[derive(Debug, Clone)]
 enum FormEvent {
-  /// 打包请求（图标字节可选，None = 用 w2a 默认图标）。
-  Pack { url: String, icon: Option<Vec<u8>> },
+  /// 打包请求（图标字节与 Basic Auth 凭据可选，None = 用 w2a 默认图标；
+  /// auth_user 为空 = 不启用 Basic Auth）。
+  Pack {
+    url: String,
+    icon: Option<Vec<u8>>,
+    auth_user: String,
+    auth_password: String,
+  },
   /// 后台打包线程的完成回执。打包必须离开事件循环线程：阻塞主循环 = GDK 停止
   /// 回应 WM ping = 桌面会话判「未响应」（Linux 实测被 GNOME 判死，e2e.sh [4] 门禁）。
   PackDone { out: std::path::PathBuf, result: Result<u64, String>, icon_note: String },
@@ -52,15 +58,19 @@ fn main() {
 fn cli_pack(args: impl Iterator<Item = String>) {
   let mut it = args;
   let Some(url) = it.next() else {
-    eprintln!("usage: web2app --pack <url> [--icon <png>] [--out <file>]");
+    eprintln!("usage: web2app --pack <url> [--icon <png>] [--out <file>] [--auth-user <u>] [--auth-password <p>]");
     std::process::exit(2);
   };
   let mut icon_path = None;
   let mut out = None;
+  let mut auth_user = String::new();
+  let mut auth_password = String::new();
   while let (Some(k), Some(v)) = (it.next(), it.next()) {
     match k.as_str() {
       "--icon" => icon_path = Some(std::path::PathBuf::from(v)),
       "--out" => out = Some(std::path::PathBuf::from(v)),
+      "--auth-user" => auth_user = v,
+      "--auth-password" => auth_password = v,
       other => {
         eprintln!("unknown option: {other}");
         std::process::exit(2);
@@ -78,7 +88,7 @@ fn cli_pack(args: impl Iterator<Item = String>) {
     None => None,
   };
   let out = out.unwrap_or_else(|| default_output_path(&url));
-  match crate::platform::pack(&out, &url, icon) {
+  match crate::platform::pack(&out, &url, icon, &auth_user, &auth_password) {
     Ok(b) => println!("OK {} ({} bytes)", b.exe.display(), b.size),
     Err(e) => {
       eprintln!("PACK_FAIL: {e}");
@@ -110,8 +120,8 @@ fn run_master() {
     .with_html(ui::form_html())
     .with_ipc_handler(move |req| {
       // 协议契约的行为级规格见 ui::parse_pack_message 测试
-      if let Some((url, icon)) = ui::parse_pack_message(&req.into_body()) {
-        let _ = ipc.send_event(FormEvent::Pack { url, icon });
+      if let Some((url, icon, auth_user, auth_password)) = ui::parse_pack_message(&req.into_body()) {
+        let _ = ipc.send_event(FormEvent::Pack { url, icon, auth_user, auth_password });
       }
     });
   // 挂载经平台外壳：Windows 直通 `build(window)`；Linux 必须走 GTK 容器
@@ -139,7 +149,12 @@ fn run_master() {
   event_loop.run(move |event, _, control_flow| {
     *control_flow = ControlFlow::Wait;
     match event {
-      tao::event::Event::UserEvent(FormEvent::Pack { url, icon }) => start_pack(&proxy, url, icon),
+      tao::event::Event::UserEvent(FormEvent::Pack {
+        url,
+        icon,
+        auth_user,
+        auth_password,
+      }) => start_pack(&proxy, url, icon, auth_user, auth_password),
       tao::event::Event::UserEvent(FormEvent::PackDone { out, result, icon_note }) => {
         master.on_pack_done(&out, result, &icon_note);
       }
@@ -185,6 +200,8 @@ fn start_pack(
   proxy: &tao::event_loop::EventLoopProxy<FormEvent>,
   url: String,
   icon: Option<Vec<u8>>,
+  auth_user: String,
+  auth_password: String,
 ) {
   let out = default_output_path(&url);
   let proxy = proxy.clone();
@@ -200,7 +217,7 @@ fn start_pack(
         }
       }
     };
-    let result = platform::pack(&out, &url, icon)
+    let result = platform::pack(&out, &url, icon, &auth_user, &auth_password)
       .map(|b| b.size)
       .map_err(|e| e.to_string());
     let _ = proxy.send_event(FormEvent::PackDone { out, result, icon_note });

@@ -143,10 +143,12 @@ pub(crate) fn pack(
   out_path: &Path,
   url: &str,
   icon_png: Option<Vec<u8>>,
+  auth_user: &str,
+  auth_password: &str,
 ) -> std::io::Result<crate::builder::BuildOutput> {
   let elf_tmp = out_path.with_extension("tmp.elf");
   let staging = std::env::temp_dir().join(format!("w2a-deb-{}", package_name(url)));
-  let result = build_deb(out_path, url, icon_png, &elf_tmp, &staging);
+  let result = build_deb(out_path, url, icon_png, auth_user, auth_password, &elf_tmp, &staging);
   let _ = std::fs::remove_file(&elf_tmp);
   let _ = std::fs::remove_dir_all(&staging);
   result
@@ -156,6 +158,8 @@ fn build_deb(
   out_path: &Path,
   url: &str,
   icon_png: Option<Vec<u8>>,
+  auth_user: &str,
+  auth_password: &str,
   elf_tmp: &Path,
   staging: &Path,
 ) -> std::io::Result<crate::builder::BuildOutput> {
@@ -185,7 +189,7 @@ fn build_deb(
   std::fs::write(staging.join("DEBIAN/control"), control_text(&pkg, arch, url))?;
 
   // 2) 共享编排骨架：模板 + 尾部配置 → 裸 ELF（签名/图标注入的 hook 点同 Windows）
-  crate::builder::pack(elf_tmp, url, icon_png)?;
+  crate::builder::pack(elf_tmp, url, icon_png, auth_user, auth_password)?;
 
   // 3) payload：ELF+tail（755）
   let installed_bin = bin.join(&pkg);

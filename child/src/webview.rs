@@ -237,6 +237,10 @@ pub fn build_webview<'a>(
   context: &'a mut WebContext,
   proxy: EventLoopProxy<ChildEvent>,
 ) -> Result<WebView, wry::Error> {
+  // 加载地址就是干净的 `config.url`（不含 `user:pass@` 内嵌凭据）：
+  // 浏览器/引擎不会基于内嵌 userinfo 预发 `Authorization` 头，正确姿势是
+  // 响应服务端 401 挑战时经 `Authorization: Basic` 头发回（见下方
+  // `platform::install_basic_auth`，对齐安卓 WebView 的 `onReceivedHttpAuthRequest`）。
   // 当前页 host：站内/跨站判定的基准，随导航更新（on_page_load 回填）。
   // 回调均在同一线程执行，锁仅为跨闭包共享状态，无竞争。
   let current_host = Arc::new(Mutex::new(tail_core::host_of(&config.url)));
@@ -328,6 +332,11 @@ pub fn build_webview<'a>(
   // 「送达内容层之前」兜底。动作经 proxy 回流主循环，不在 COM 回调内同步
   // evaluate_script（WebView2 回调重入风险）。注册失败静默忽略；阶段门控见 HOST_ONLY。
   crate::platform::install_keys(&webview, home_proxy);
+  // HTTP Basic Auth：挂接 401 挑战事件（对齐安卓 WebView onReceivedHttpAuthRequest）。
+  // 无凭据时直接 return，零额外行为。Windows 走 WebView2 `BasicAuthenticationRequested`，
+  // Linux 侧为 no-op（WebKitGTK 在 URL 加载层自动携带 http-auth header 或通过
+  // `WebViewAuth` 信号；暂不实现，等实际有需求再接）。
+  crate::platform::install_basic_auth(&webview, &config.auth_user, &config.auth_password, &config.url);
   Ok(webview)
 }
 

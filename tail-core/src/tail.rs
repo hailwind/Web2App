@@ -34,42 +34,75 @@ pub struct AppConfig {
   pub title: String,
   /// 用户图标 PNG 原始字节（可选；None = 继承 w2a 默认窗口图标）。
   pub icon_png: Option<Vec<u8>>,
+  /// HTTP Basic Auth 用户名（可选；空 = 不启用）。
+  pub auth_user: String,
+  /// HTTP Basic Auth 密码（可选；空 = 不启用）。
+  pub auth_password: String,
 }
 
 impl AppConfig {
   pub fn new(url: String, title: String, icon_png: Option<Vec<u8>>) -> Self {
-    Self { url, title, icon_png }
+    Self { url, title, icon_png, auth_user: String::new(), auth_password: String::new() }
+  }
+
+  /// 带 Basic Auth 凭据的构造器。`user` 为空时等价于 [`new`]。
+  pub fn with_auth(url: String, title: String, icon_png: Option<Vec<u8>>, auth_user: String, auth_password: String) -> Self {
+    Self { url, title, icon_png, auth_user, auth_password }
+  }
+
+  /// 凭据是否已配置（用户名或密码非空）。
+  ///
+  /// child 运行时据此决定是否挂接 WebView2 `BasicAuthenticationRequested`
+  /// 处理器（401 挑战时把凭据经 `Authorization: Basic` 头发回）；
+  /// 无凭据时不注册处理器，行为与未启用认证完全一致。
+  pub fn has_auth(&self) -> bool {
+    !self.auth_user.is_empty() || !self.auth_password.is_empty()
   }
 
   /// 序列化为尾部 payload JSON（手写转义，零 serde 依赖，符合极简红线）。
   /// 图标存在时以 base64 内嵌（IPC 传输与存储共用同一编码）。
+  /// 字段顺序：`url → title → icon → user → pass`（icon 可选，user/pass 可选）。
   pub fn to_json(&self) -> String {
-    match &self.icon_png {
-      Some(png) => format!(
-        "{{\"url\":{},\"title\":{},\"icon\":\"{}\"}}",
-        json_escape(&self.url),
-        json_escape(&self.title),
-        base64_encode(png)
-      ),
-      None => format!(
-        "{{\"url\":{},\"title\":{}}}",
-        json_escape(&self.url),
-        json_escape(&self.title)
-      ),
+    let mut out = String::with_capacity(128);
+    out.push_str("{\"url\":");
+    out.push_str(&json_escape(&self.url));
+    out.push_str(",\"title\":");
+    out.push_str(&json_escape(&self.title));
+    if let Some(ref png) = self.icon_png {
+      out.push_str(",\"icon\":\"");
+      out.push_str(&base64_encode(png));
+      out.push('"');
     }
+    if !self.auth_user.is_empty() {
+      out.push_str(",\"user\":");
+      out.push_str(&json_escape(&self.auth_user));
+    }
+    if !self.auth_password.is_empty() {
+      out.push_str(",\"pass\":");
+      out.push_str(&json_escape(&self.auth_password));
+    }
+    out.push('}');
+    out
   }
 
   /// 从尾部 payload JSON 解析。
   ///
-  /// 隐藏契约：字段按 `url → title → icon` 顺序扫描（`to_json` 固定此序，
-  /// 协议闭环内自产自销故安全；若字段顺序变更需同步改两处）。
-  /// `icon` 字段可缺失（向后兼容旧产物）→ None。
+  /// 隐藏契约：`url` 和 `title` 为必需字段（按 `url → title` 顺序提取）；
+  /// `icon`/`user`/`pass` 为可选字段，在 title 之后的剩余串中按 key 搜索。
+  /// （`to_json` 固定此序，协议闭环内自产自销故安全；若字段顺序变更需同步改两处。）
+  /// 旧产物（无 user/pass 字段）→ 空串，`has_auth()` 为 false，行为不变。
   pub fn from_json(json: &str) -> Option<Self> {
     let (url, rest) = extract_string_field(json, "url")?;
     let (title, rest) = extract_string_field(&rest, "title")?;
     let icon_png = extract_string_field(&rest, "icon")
       .and_then(|(b64, _)| base64_decode(&b64));
-    Some(Self { url, title, icon_png })
+    let auth_user = extract_string_field(&rest, "user")
+      .map(|(s, _)| s)
+      .unwrap_or_default();
+    let auth_password = extract_string_field(&rest, "pass")
+      .map(|(s, _)| s)
+      .unwrap_or_default();
+    Some(Self { url, title, icon_png, auth_user, auth_password })
   }
 }
 
@@ -420,6 +453,59 @@ mod tests {
     let c = sample();
     let parsed = AppConfig::from_json(&c.to_json()).unwrap();
     assert_eq!(parsed, c);
+  }
+
+  #[test]
+  fn json_roundtrip_with_auth() {
+    let c = AppConfig::with_auth(
+      "https://admin.example.com/panel".into(),
+      "Panel".into(),
+      None,
+      "svc".into(),
+      "s3cret pass".into(),
+    );
+    let parsed = AppConfig::from_json(&c.to_json()).unwrap();
+    assert_eq!(parsed, c);
+    // 凭据字段可读回
+    assert_eq!(parsed.auth_user, "svc");
+    assert_eq!(parsed.auth_password, "s3cret pass");
+    assert!(parsed.has_auth());
+    // payload 确实含 user / pass 字段
+    let j = c.to_json();
+    assert!(j.contains("\"user\":"));
+    assert!(j.contains("\"pass\":"));
+  }
+
+  #[test]
+  fn json_missing_auth_fields_backcompatible() {
+    // 旧产物（仅 url + title + 可选 icon，无 user/pass）→ 凭据为空，has_auth 为 false
+    let json = r#"{"url":"https://x.com","title":"T"}"#;
+    let c = AppConfig::from_json(json).unwrap();
+    assert_eq!(c.url, "https://x.com");
+    assert!(c.auth_user.is_empty());
+    assert!(c.auth_password.is_empty());
+    assert!(!c.has_auth());
+    // 有图标但无凭据
+    let with_icon = r#"{"url":"https://y.com","title":"Y","icon":"QUJD"}"#;
+    let c2 = AppConfig::from_json(with_icon).unwrap();
+    assert!(c2.icon_png.is_some());
+    assert!(c2.auth_user.is_empty());
+  }
+
+  #[test]
+  fn has_auth_is_false_when_both_empty() {
+    let c = AppConfig::new("https://a.com/p".into(), "A".into(), None);
+    assert!(!c.has_auth());
+  }
+
+  #[test]
+  fn has_auth_is_true_when_user_or_pass_present() {
+    // 仅用户名
+    let c = AppConfig::with_auth("https://a.com".into(), "A".into(), None, "svc".into(), String::new());
+    assert!(c.has_auth());
+    // 仅密码
+    let c2 = AppConfig::with_auth("https://a.com".into(), "A".into(), None, String::new(), "pw".into());
+    assert!(c2.has_auth());
   }
 
   #[test]

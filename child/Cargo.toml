@@ -15,6 +15,11 @@ tao = { workspace = true }
 # 无此依赖 → 必须按目标平台下沉，否则 Unix 目标会去编译 Windows crate。
 [target.'cfg(windows)'.dependencies]
 webview2-com = { workspace = true }
+# Basic Auth（401 挑战 → ICoreWebView2_10::add_BasicAuthenticationRequested）需要
+# windows-rs 的 PWSTR/PCWSTR/Interface。wry 已引入 windows 0.62.2，此处显式声明
+# 仅为 `use windows::core::...`（cargo 不允许 use 未直接声明的 crate）。
+# 默认 features（无 Win32 feature）= 纯 Rust 类型 + 零新系统 API，不影响产物体积。
+windows = { workspace = true }
 
 # Linux-only：GTK 外壳（弹窗顶层窗、全屏切换）需要 gtk-rs 类型。
 # 非新增依赖——`gtk` 早已由 tao/wry 传递引入并在 Cargo.lock 中锁定（0.18.2），

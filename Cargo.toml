@@ -24,6 +24,11 @@ png = "0.18"
 # 不引入任何新 crate、不增加产物体积（见 audit.ps1 的 cargo tree 断言）。
 webview2-com = "0.39"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+# windows-rs（新版）：`windows::core::{PWSTR, PCWSTR, Interface}`。child 挂接
+# WebView2 `BasicAuthenticationRequested` 事件（401 挑战时按主域判定回填 user/pass）需要。
+# wry 已在 child 依赖树引入 windows 0.62.2；显式声明仅为把传递依赖提升为直接依赖
+# 以便 `use windows::core::...`（cargo 不允许 `use` 未直接声明的 crate）。
+windows = "0.62"
 
 # Release 产物极致轻量：全 workspace 共享同一组优化开关。
 # panic=abort 仅作用于 release；测试走 dev profile（unwind），不受影响。
